@@ -1,28 +1,26 @@
-# Fly.io deployment config for the yt-dlp service.
-# 1) Install flyctl: https://fly.io/docs/hands-on/install-flyctl/
-# 2) In this folder:  fly launch --no-deploy   (accept defaults, keep this fly.toml)
-# 3) fly secrets set API_KEY="<same value you put in Lovable secret YTDLP_API_KEY>"
-# 4) fly deploy
-# Copy the public URL (https://<app>.fly.dev) into Lovable secret YTDLP_URL.
+# fly.toml app configuration file generated for yt-dlp-n1xh3g on 2026-07-15T07:57:47Z
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
-app = "vens-ytdlp"
-primary_region = "cdg"   # Paris — change if you prefer another region
+app = 'yt-dlp-n1xh3g'
+primary_region = 'cdg'
 
 [build]
-  dockerfile = "Dockerfile"
+  dockerfile = 'Dockerfile'
 
 [env]
-  PORT = "8080"
-  ALLOW_ORIGINS = "*"
+  ALLOW_ORIGINS = '*'
+  PORT = '8080'
 
 [http_service]
   internal_port = 8080
   force_https = true
-  auto_stop_machines = "stop"
+  auto_stop_machines = 'stop'
   auto_start_machines = true
   min_machines_running = 0
 
 [[vm]]
-  cpu_kind = "shared"
+  cpu_kind = 'shared'
   cpus = 1
   memory_mb = 512
