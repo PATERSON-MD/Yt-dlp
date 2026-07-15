@@ -1,0 +1,12 @@
+services:
+  ytdlp:
+    build: .
+    image: vens-ytdlp:latest
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      # Set a long random secret and put the same value in the Lovable secret YTDLP_API_KEY
+      API_KEY: "change-me-to-a-long-random-string"
+      # Comma-separated list, or "*" for open CORS
+      ALLOW_ORIGINS: "*"
