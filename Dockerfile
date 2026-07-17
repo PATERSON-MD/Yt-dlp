@@ -6,7 +6,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-RUN pip install --no-cache-dir "yt-dlp[default]" fastapi "uvicorn[standard]" pydantic
+# AJOUTEZ httpx ici !
+RUN pip install --no-cache-dir "yt-dlp[default]" fastapi "uvicorn[standard]" pydantic httpx
 
 COPY server.py /app/server.py
 
