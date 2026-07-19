@@ -1,0 +1,12 @@
+services:
+  - type: web
+    name: vens-ytdlp
+    env: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    envVars:
+      - key: API_KEY
+        sync: false   # set manually in the Render dashboard to your generated secret
+      - key: PORT
+        value: 8000
