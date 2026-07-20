@@ -57,13 +57,25 @@ def extract():
         "skip_download": True,
         "noplaylist": True,
         "extract_flat": False,
+        "nocheckcertificate": True,
+        "retries": 5,
+        "fragment_retries": 5,
     }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
-        return jsonify({"detail": f"Extraction failed: {e}"}), 502
+        error = str(e)
+
+        if "Video not available" in error:
+            return jsonify({
+                "detail": "Cette vidéo est indisponible, privée ou ne peut pas être extraite actuellement."
+            }), 502
+
+        return jsonify({
+            "detail": f"Extraction failed: {error}"
+        }), 502
 
     if not info:
         return jsonify({"detail": "No info returned"}), 502
