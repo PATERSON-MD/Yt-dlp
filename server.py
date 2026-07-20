@@ -1,9 +1,8 @@
 """
-VENS-DOWNLOADER — Production Server v11.3 (10/10)
-✅ FIX: after_this_request remplacé par threading.Timer
-✅ FIX: Accept-Encoding sans "br"
-✅ FIX: socket_timeout ajouté
-✅ Architecture finale optimisée
+VENS-DOWNLOADER — Production Server v11.5
+✅ TEST: Format simplifié best[height<=720]/best
+✅ YouTube: player_client android
+✅ Logs version yt-dlp
 """
 
 import os
@@ -13,6 +12,7 @@ import uuid
 import shutil
 import threading
 import logging
+import traceback
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -46,17 +46,20 @@ MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE", "500")) * 1024 * 1024
 FILE_EXPIRE_TIME = int(os.environ.get("FILE_EXPIRE_TIME", "300"))
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "2"))
 DELETE_AFTER_DOWNLOAD = os.environ.get("DELETE_AFTER_DOWNLOAD", "true").lower() == "true"
-CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "10"))  # Secondes avant suppression
+CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "10"))
 
 # Créer le dossier
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
-# Logging
+# Logging détaillé
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+# Afficher la version de yt-dlp au démarrage
+logger.info(f"📦 yt-dlp version: {yt_dlp.version.__version__}")
 
 # Compteur de téléchargements actifs
 active_downloads = 0
@@ -67,7 +70,6 @@ download_lock = threading.Lock()
 # =========================
 
 def check_ffmpeg():
-    """Vérifier que FFmpeg est installé"""
     ffmpeg_path = shutil.which("ffmpeg")
     if ffmpeg_path:
         logger.info(f"✅ FFmpeg trouvé: {ffmpeg_path}")
@@ -75,15 +77,10 @@ def check_ffmpeg():
         logger.info(f"   Version: {version}")
         return True
     else:
-        logger.error("❌ FFmpeg NON trouvé - Installation requise")
-        logger.error("   Sur Render: ajouter 'ffmpeg' dans Dockerfile")
+        logger.error("❌ FFmpeg NON trouvé")
         return False
 
-# Vérifier au démarrage
 FFMPEG_AVAILABLE = check_ffmpeg()
-
-if not FFMPEG_AVAILABLE:
-    logger.warning("⚠️  ATTENTION: FFmpeg est requis pour la fusion audio/vidéo")
 
 # =========================
 # SÉCURITÉ
@@ -103,11 +100,9 @@ def valid_url(url):
         return False
 
 def safe_filename(filename):
-    """Nettoyer le nom de fichier"""
     return re.sub(r"[^a-zA-Z0-9._-]", "_", filename)
 
 def is_within_download_dir(filepath):
-    """Vérifier que le fichier est bien dans DOWNLOAD_DIR"""
     try:
         resolved_path = filepath.resolve()
         return DOWNLOAD_DIR.resolve() in resolved_path.parents or resolved_path.parent == DOWNLOAD_DIR.resolve()
@@ -115,22 +110,22 @@ def is_within_download_dir(filepath):
         return False
 
 # =========================
-# FORMAT - SIMPLIFIÉ
+# FORMAT - SIMPLIFIÉ POUR TEST
 # =========================
 
-def get_format(quality):
-    """Obtenir le format yt-dlp - limité à 720p pour Render"""
+def get_formats_with_fallback(quality):
+    """Retourne une liste de formats à essayer - VERSION SIMPLIFIÉE"""
     q = (quality or "720").lower()
     
     if q == "audio":
-        return "bestaudio/best"
+        return ["bestaudio/best"]
     
-    # Limiter à 720p maximum pour Render
-    if q in ("2160", "4k", "1080"):
-        logger.warning(f"Qualité {q} demandée, limitée à 720p pour Render")
-        q = "720"
-    
-    return "bestvideo[height<=720]+bestaudio/best[height<=720]/best"
+    # ⭐ TEST: Uniquement des formats déjà assemblés
+    return [
+        "best[height<=720]/best",  # Le meilleur avec hauteur <= 720
+        "best",                     # Le meilleur tout court
+        "bestvideo[height<=720]+bestaudio/best"  # Fallback si besoin
+    ]
 
 # =========================
 # DÉTECTION PLATEFORME
@@ -192,144 +187,144 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "vens-ytdlp",
-        "version": "11.3",
-        "mode": "production",
-        "auth_required": bool(API_KEY),
+        "version": "11.5",
+        "ytdlp_version": yt_dlp.version.__version__,
         "ffmpeg": FFMPEG_AVAILABLE,
-        "max_quality": "720p",
         "active_downloads": active_downloads,
         "max_concurrent": MAX_CONCURRENT_DOWNLOADS,
-        "download_dir": str(DOWNLOAD_DIR),
-        "storage_free_mb": shutil.disk_usage(DOWNLOAD_DIR).free // (1024*1024),
-        "delete_after_download": DELETE_AFTER_DOWNLOAD,
-        "cleanup_delay": CLEANUP_DELAY
+        "storage_free_mb": shutil.disk_usage(DOWNLOAD_DIR).free // (1024*1024)
     })
 
 # =========================
-# MOTEUR DE TÉLÉCHARGEMENT - V11.3
+# MOTEUR DE TÉLÉCHARGEMENT - SIMPLIFIÉ
 # =========================
 
 def download_media(url, quality):
-    """Télécharger un média avec yt-dlp"""
+    """Télécharger un média avec format simplifié"""
     global active_downloads
     
-    # Vérifier les téléchargements concurrents
     with download_lock:
         if active_downloads >= MAX_CONCURRENT_DOWNLOADS:
             raise Exception("Serveur occupé, réessayez dans quelques instants")
         active_downloads += 1
     
     try:
-        # 1. Générer un ID unique
         file_uuid = str(uuid.uuid4())
-        output_template = str(DOWNLOAD_DIR / f"{file_uuid}.%(ext)s")
-        
-        # 2. Configurer yt-dlp (SANS extractor_args)
-        ydl_opts = {
-            "format": get_format(quality),
-            "outtmpl": output_template,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-            "nocheckcertificate": True,
-            "ignoreerrors": False,
-            "retries": 5,
-            "fragment_retries": 5,
-            "merge_output_format": "mp4" if not quality.lower() == "audio" else None,
-            "extract_flat": False,
-            "geo_bypass": True,
-            "geo_bypass_country": "FR",
-            "sleep_interval": 1,
-            "max_sleep_interval": 3,
-            "socket_timeout": 30,  # ⭐ NOUVEAU - Évite les blocages
-            "http_headers": {
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-                "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
-                "Accept-Encoding": "gzip, deflate",  # ⭐ CORRIGÉ - Sans "br"
-                "DNT": "1",
-                "Connection": "keep-alive"
-            }
-        }
-        
-        # Audio seulement
-        if quality.lower() == "audio":
-            ydl_opts["format"] = "bestaudio/best"
-            ydl_opts["postprocessors"] = [
-                {
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192"
-                }
-            ]
-            output_template = str(DOWNLOAD_DIR / f"{file_uuid}.mp3")
-            ydl_opts["outtmpl"] = output_template
-        
-        # 3. Télécharger
         platform = detect_platform(url)
-        logger.info(f"📥 [{platform}] Téléchargement: {url[:60]}... (qualité: {quality})")
+        formats_to_try = get_formats_with_fallback(quality)
         
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+        last_error = None
+        
+        for fmt in formats_to_try:
+            try:
+                logger.info(f"📥 [{platform}] Essai format: {fmt}")
                 
-            if not info:
-                raise Exception("Aucune information récupérée")
+                output_template = str(DOWNLOAD_DIR / f"{file_uuid}.%(ext)s")
                 
-        except Exception as e:
-            logger.error(f"❌ Erreur yt-dlp: {e}")
-            for f in DOWNLOAD_DIR.glob(f"{file_uuid}.*"):
-                f.unlink(missing_ok=True)
-            raise Exception(f"Erreur de téléchargement: {str(e)}")
+                ydl_opts = {
+                    "format": fmt,
+                    "outtmpl": output_template,
+                    "quiet": False,
+                    "no_warnings": False,
+                    "noplaylist": True,
+                    "nocheckcertificate": True,
+                    "ignoreerrors": False,
+                    "retries": 5,
+                    "fragment_retries": 5,
+                    "merge_output_format": "mp4" if not quality.lower() == "audio" else None,
+                    "extract_flat": False,
+                    "geo_bypass": True,
+                    "geo_bypass_country": "FR",
+                    "sleep_interval": 1,
+                    "max_sleep_interval": 3,
+                    "socket_timeout": 30,
+                    "http_headers": {
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+                        "Accept-Language": "fr-FR,fr;q=0.9,en-US;q=0.8,en;q=0.7",
+                        "Accept-Encoding": "gzip, deflate",
+                        "DNT": "1",
+                        "Connection": "keep-alive"
+                    },
+                    # ⭐ YouTube: player_client android pour contourner les blocages
+                    "extractor_args": {
+                        "youtube": {
+                            "player_client": ["android"]
+                        }
+                    }
+                }
+                
+                # Audio seulement
+                if quality.lower() == "audio":
+                    ydl_opts["format"] = "bestaudio/best"
+                    ydl_opts["postprocessors"] = [
+                        {
+                            "key": "FFmpegExtractAudio",
+                            "preferredcodec": "mp3",
+                            "preferredquality": "192"
+                        }
+                    ]
+                    output_template = str(DOWNLOAD_DIR / f"{file_uuid}.mp3")
+                    ydl_opts["outtmpl"] = output_template
+                
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                
+                if not info:
+                    raise Exception("Aucune information récupérée")
+                
+                # Trouver le fichier
+                final_file = None
+                
+                # Méthode 1: Pattern exact
+                files = list(DOWNLOAD_DIR.glob(f"{file_uuid}.*"))
+                if files:
+                    final_file = files[0]
+                
+                # Méthode 2: Fichiers récents
+                if not final_file:
+                    current_time = time.time()
+                    for file in DOWNLOAD_DIR.iterdir():
+                        if file.is_file() and (current_time - file.stat().st_mtime) < 10:
+                            if file.name.startswith(file_uuid) or not final_file:
+                                final_file = file
+                                if file.name.startswith(file_uuid):
+                                    break
+                
+                if not final_file or not final_file.exists():
+                    raise Exception("Fichier introuvable après téléchargement")
+                
+                # Vérifier la taille
+                file_size = final_file.stat().st_size
+                if file_size == 0:
+                    final_file.unlink()
+                    raise Exception("Fichier vide")
+                
+                if file_size > MAX_FILE_SIZE:
+                    final_file.unlink()
+                    raise Exception(f"Fichier trop volumineux ({file_size} > {MAX_FILE_SIZE})")
+                
+                # Renommer
+                ext = final_file.suffix
+                clean_name = f"vens_{int(time.time())}_{file_uuid[:8]}{ext}"
+                clean_path = DOWNLOAD_DIR / clean_name
+                
+                if final_file != clean_path:
+                    final_file.rename(clean_path)
+                    final_file = clean_path
+                
+                logger.info(f"✅ [{platform}] Téléchargement réussi avec format: {fmt}")
+                return final_file, info
+                
+            except Exception as e:
+                last_error = str(e)
+                logger.warning(f"⚠️ Format {fmt} a échoué: {e}")
+                # Nettoyer
+                for f in DOWNLOAD_DIR.glob(f"{file_uuid}.*"):
+                    f.unlink(missing_ok=True)
+                continue
         
-        # 4. Trouver le fichier - Méthode robuste
-        final_file = None
-        
-        # Méthode 1: Pattern exact
-        files = list(DOWNLOAD_DIR.glob(f"{file_uuid}.*"))
-        if files:
-            final_file = files[0]
-        
-        # Méthode 2: Fichiers récents
-        if not final_file:
-            current_time = time.time()
-            for file in DOWNLOAD_DIR.iterdir():
-                if file.is_file() and (current_time - file.stat().st_mtime) < 10:
-                    if file.name.startswith(file_uuid) or not final_file:
-                        final_file = file
-                        if file.name.startswith(file_uuid):
-                            break
-        
-        # Méthode 3: Dernier fichier
-        if not final_file:
-            files = list(DOWNLOAD_DIR.iterdir())
-            if files:
-                final_file = max(files, key=lambda f: f.stat().st_mtime)
-        
-        if not final_file or not final_file.exists():
-            raise Exception("Fichier introuvable après téléchargement")
-        
-        # 5. Vérifier la taille
-        file_size = final_file.stat().st_size
-        if file_size == 0:
-            final_file.unlink()
-            raise Exception("Fichier vide")
-        
-        if file_size > MAX_FILE_SIZE:
-            final_file.unlink()
-            raise Exception(f"Fichier trop volumineux ({file_size} > {MAX_FILE_SIZE})")
-        
-        # 6. Renommer proprement
-        ext = final_file.suffix
-        clean_name = f"vens_{int(time.time())}_{file_uuid[:8]}{ext}"
-        clean_path = DOWNLOAD_DIR / clean_name
-        
-        if final_file != clean_path:
-            final_file.rename(clean_path)
-            final_file = clean_path
-        
-        logger.info(f"✅ [{platform}] Téléchargement réussi: {clean_name} ({file_size//1024} KB)")
-        return final_file, info
+        raise Exception(f"Tous les formats ont échoué. Dernière erreur: {last_error}")
         
     finally:
         with download_lock:
@@ -348,13 +343,16 @@ def extract():
     url = (data.get("url") or "").strip()
     quality = (data.get("quality") or "720").strip()
     
+    logger.info(f"📥 Requête reçue - URL: {url[:60]}... Qualité: {quality}")
+    
     if not valid_url(url):
+        logger.error(f"❌ URL invalide: {url}")
         return jsonify({"error": "URL invalide"}), 400
     
     try:
         file_path, info = download_media(url, quality)
         
-        return jsonify({
+        response = {
             "success": True,
             "title": info.get("title", "VENS-DOWNLOADER"),
             "thumbnail": info.get("thumbnail", ""),
@@ -365,11 +363,17 @@ def extract():
             "media_type": "audio" if quality.lower() == "audio" else "video",
             "download_url": f"/download/{file_path.name}",
             "ext": file_path.suffix[1:],
-            "quality": quality,
-            "expires_in": FILE_EXPIRE_TIME
-        })
+            "quality": quality
+        }
+        
+        logger.info(f"✅ Succès: {file_path.name} ({file_path.stat().st_size} octets)")
+        return jsonify(response)
     
     except Exception as e:
+        logger.error(f"❌ Erreur détaillée: {e}")
+        logger.error(traceback.format_exc())
+        
+        # Nettoyer les fichiers récents
         try:
             for f in DOWNLOAD_DIR.iterdir():
                 if f.is_file() and (time.time() - f.stat().st_mtime) < 5:
@@ -377,14 +381,13 @@ def extract():
         except:
             pass
         
-        logger.error(f"❌ Erreur extraction: {e}")
         return jsonify({
             "error": str(e),
-            "detail": "Erreur lors du téléchargement"
+            "detail": "Erreur lors du téléchargement. Vérifiez l'URL ou réessayez."
         }), 502
 
 # =========================
-# DOWNLOAD ROUTE (AVEC SUPPRESSION DIFFÉRÉE)
+# DOWNLOAD ROUTE
 # =========================
 
 @app.get("/download/<filename>")
@@ -395,7 +398,6 @@ def download(filename):
     filename = safe_filename(filename)
     file_path = DOWNLOAD_DIR / filename
     
-    # Vérifier que le fichier est bien dans le dossier
     if not is_within_download_dir(file_path):
         logger.warning(f"⚠️ Tentative de sortie du dossier: {filename}")
         return jsonify({"error": "Accès interdit"}), 403
@@ -403,7 +405,6 @@ def download(filename):
     if not file_path.exists():
         return jsonify({"error": "Fichier expiré ou introuvable"}), 404
     
-    # Déterminer le type MIME
     ext = file_path.suffix.lower()
     mime_types = {
         ".mp4": "video/mp4",
@@ -415,13 +416,12 @@ def download(filename):
     }
     mimetype = mime_types.get(ext, "application/octet-stream")
     
-    # ⭐ CORRIGÉ - Suppression différée avec threading.Timer
     if DELETE_AFTER_DOWNLOAD:
         def delete_later():
             try:
                 if file_path.exists():
                     file_path.unlink()
-                    logger.info(f"🗑️ Fichier supprimé après {CLEANUP_DELAY}s: {filename}")
+                    logger.info(f"🗑️ Fichier supprimé: {filename}")
             except Exception as e:
                 logger.error(f"Erreur suppression: {e}")
         
@@ -463,6 +463,11 @@ def get_info():
         "http_headers": {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
             "Accept-Encoding": "gzip, deflate"
+        },
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android"]
+            }
         }
     }
     
@@ -486,35 +491,12 @@ def get_info():
             "duration": info.get("duration", 0),
             "platform": detect_platform(url),
             "available_qualities": sorted(list(available_qualities)) or ["720p"],
-            "ext": info.get("ext", "mp4"),
-            "description": info.get("description", "")[:200]
+            "ext": info.get("ext", "mp4")
         })
     
     except Exception as e:
+        logger.error(f"❌ Erreur info: {e}")
         return jsonify({"error": str(e)}), 500
-
-# =========================
-# STATS ENDPOINT
-# =========================
-
-@app.get("/stats")
-def stats():
-    if not check_api_key():
-        return jsonify({"error": "Invalid API key"}), 401
-    
-    files = list(DOWNLOAD_DIR.iterdir())
-    total_size = sum(f.stat().st_size for f in files if f.is_file())
-    
-    return jsonify({
-        "total_files": len(files),
-        "total_size_mb": round(total_size / (1024 * 1024), 2),
-        "active_downloads": active_downloads,
-        "max_concurrent": MAX_CONCURRENT_DOWNLOADS,
-        "ffmpeg": FFMPEG_AVAILABLE,
-        "storage_free_mb": shutil.disk_usage(DOWNLOAD_DIR).free // (1024*1024),
-        "delete_after_download": DELETE_AFTER_DOWNLOAD,
-        "cleanup_delay": CLEANUP_DELAY
-    })
 
 # =========================
 # RUN SERVER
@@ -526,24 +508,20 @@ if __name__ == "__main__":
     
     print("""
 ╔══════════════════════════════════════════════════════════════════════╗
-║  🚀 VENS-DOWNLOADER SERVER v11.3 — 10/10 FINAL                     ║
+║  🚀 VENS-DOWNLOADER SERVER v11.5 — TEST FORMAT SIMPLIFIÉ          ║
+║  📦 yt-dlp: {}                                                ║
 ║  ✅ FFmpeg:  {}                                                    ║
 ║  📁 Downloads: {}  ║
 ║  🔐 API Key:  {}                       ║
-║  📊 Max concurrent: {} (optimisé Render)                           ║
-║  🎯 Max quality: 720p                                              ║
-║  🗑️ Delete after download: {} (après {}s)                          ║
-║  🌐 Server: http://0.0.0.0:{}                                      ║
-║  ⏱️  Socket timeout: 30s                                           ║
+║  📊 Max concurrent: {}                                              ║
+║  🎯 Format test: best[height<=720]/best                            ║
 ╚══════════════════════════════════════════════════════════════════════╝
     """.format(
+        yt_dlp.version.__version__,
         "✅" if FFMPEG_AVAILABLE else "❌",
         DOWNLOAD_DIR,
         "✅" if API_KEY else "❌",
-        MAX_CONCURRENT_DOWNLOADS,
-        "✅" if DELETE_AFTER_DOWNLOAD else "❌",
-        CLEANUP_DELAY,
-        port
+        MAX_CONCURRENT_DOWNLOADS
     ))
     
     app.run(host="0.0.0.0", port=port, debug=debug)
