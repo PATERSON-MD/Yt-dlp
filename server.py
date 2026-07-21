@@ -1,10 +1,10 @@
 """
-VENS-DOWNLOADER — Production Server v12.3
-✅ FIX: Gunicorn multi-workers avec verrouillage fichier
-✅ FIX: Utilisation des hooks yt-dlp pour suivre le fichier exact
-✅ FIX: /debug/files protégé par DEBUG flag
-✅ FIX: DELETE_AFTER_DOWNLOAD activé en production
-✅ FIX: Frontend avec API Key dans les requêtes
+VENS-DOWNLOADER — Production Server v12.6
+✅ FIX: Logging configuré AVANT utilisation
+✅ FIX: BASE_URL nettoyée (rstrip)
+✅ FIX: Utilisation de request.host_url (auto-détection)
+✅ URL absolue dans /extract
+✅ 404 strict (pas de fallback dangereux)
 """
 
 import os
@@ -15,11 +15,9 @@ import shutil
 import threading
 import logging
 import traceback
-import json
 import requests
 from pathlib import Path
 from urllib.parse import urlparse
-from functools import wraps
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -27,7 +25,47 @@ import yt_dlp
 
 
 # =========================
-# CONFIGURATION
+# CONFIGURATION - LOGGING D'ABORD
+# =========================
+
+# Variables d'environnement (avant logging)
+API_KEY = os.environ.get("API_KEY", "").strip()
+DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/tmp/vens_downloads"))
+MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE", "500")) * 1024 * 1024
+FILE_EXPIRE_TIME = int(os.environ.get("FILE_EXPIRE_TIME", "600"))
+MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "2"))
+DELETE_AFTER_DOWNLOAD = os.environ.get("DELETE_AFTER_DOWNLOAD", "false").lower() == "true"
+CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
+DEBUG = os.environ.get("DEBUG", "True").lower() == "true"
+
+# ⭐ LOGGING CONFIGURÉ EN PREMIER
+logging.basicConfig(
+    level=logging.DEBUG if DEBUG else logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# Créer le dossier
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+# ⭐ BASE_URL - Nettoyée automatiquement
+BASE_URL = os.environ.get("BASE_URL", "").strip()
+if BASE_URL:
+    BASE_URL = BASE_URL.rstrip('/')
+else:
+    # Auto-détection pour Render/Fly/Railway
+    render_url = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "")
+    if render_url:
+        BASE_URL = f"https://{render_url}"
+    else:
+        BASE_URL = "http://localhost:8000"
+
+logger.info(f"📦 yt-dlp version: {yt_dlp.version.__version__}")
+logger.info(f"🔧 Mode DEBUG: {DEBUG}")
+logger.info(f"🌐 BASE_URL: {BASE_URL}")
+
+# =========================
+# FLASK APP
 # =========================
 
 app = Flask(__name__)
@@ -44,37 +82,9 @@ CORS(
     }
 )
 
-# Variables d'environnement
-API_KEY = os.environ.get("API_KEY", "").strip()
-DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/tmp/vens_downloads"))
-MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE", "500")) * 1024 * 1024
-FILE_EXPIRE_TIME = int(os.environ.get("FILE_EXPIRE_TIME", "600"))
-MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "2"))
-DELETE_AFTER_DOWNLOAD = os.environ.get("DELETE_AFTER_DOWNLOAD", "true").lower() == "true"
-CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
-DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
-
-# Créer le dossier
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-
-# Logging
-logging.basicConfig(
-    level=logging.DEBUG if DEBUG else logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
-
-logger.info(f"📦 yt-dlp version: {yt_dlp.version.__version__}")
-logger.info(f"🔧 Mode DEBUG: {DEBUG}")
-logger.info(f"🗑️ DELETE_AFTER_DOWNLOAD: {DELETE_AFTER_DOWNLOAD}")
-
 # Compteur de téléchargements actifs
 active_downloads = 0
 download_lock = threading.Lock()
-
-# ⭐ Stockage des fichiers créés pour éviter les conflits entre workers
-created_files = {}
-created_files_lock = threading.Lock()
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
@@ -195,20 +205,16 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "vens-ytdlp",
-        "version": "12.3",
+        "version": "12.6",
         "ytdlp_version": yt_dlp.version.__version__,
         "ffmpeg": FFMPEG_AVAILABLE,
         "debug": DEBUG,
+        "base_url": BASE_URL,
         "delete_after_download": DELETE_AFTER_DOWNLOAD,
         "supported_platforms": [
-            "YouTube",
-            "Dailymotion",
-            "Vimeo",
-            "Facebook",
-            "Instagram",
-            "X (Twitter)",
-            "Pinterest",
-            "Snapchat"
+            "YouTube", "Dailymotion", "Vimeo",
+            "Facebook", "Instagram", "X (Twitter)",
+            "Pinterest", "Snapchat"
         ],
         "active_downloads": active_downloads,
         "max_concurrent": MAX_CONCURRENT_DOWNLOADS,
@@ -216,11 +222,11 @@ def health():
     })
 
 # =========================
-# MOTEUR DE TÉLÉCHARGEMENT - AVEC TRACKING
+# MOTEUR DE TÉLÉCHARGEMENT
 # =========================
 
 def download_media(url, quality):
-    """Télécharger un média avec tracking du fichier"""
+    """Télécharger un média"""
     global active_downloads
     
     with download_lock:
@@ -235,8 +241,6 @@ def download_media(url, quality):
         file_uuid = str(uuid.uuid4())[:8]
         formats_to_try = get_formats_with_fallback(quality)
         last_error = None
-        final_file = None
-        final_info = None
         
         for fmt in formats_to_try:
             try:
@@ -270,15 +274,10 @@ def download_media(url, quality):
                         "Connection": "keep-alive"
                     },
                     "extractor_args": {
-                        "youtube": {
-                            "player_client": ["android"]
-                        },
-                        "dailymotion": {
-                            "player_client": ["desktop"]
-                        }
-                    },
-                    # ⭐ HOOK pour suivre le fichier exact
-                    "progress_hooks": [lambda d: logger.debug(f"📊 Progress: {d.get('status', 'unknown')}")]
+                        "youtube": {"player_client": ["android"]},
+                        "dailymotion": {"player_client": ["desktop"]},
+                        "pinterest": {"use_api": ["1"]}
+                    }
                 }
                 
                 # Audio seulement
@@ -300,23 +299,25 @@ def download_media(url, quality):
                 if not info:
                     raise Exception("Aucune information récupérée")
                 
-                # ⭐ Chercher le fichier avec le pattern exact
+                # Trouver le fichier
+                final_file = None
                 files = list(DOWNLOAD_DIR.glob(f"{file_uuid}.*"))
-                if not files:
-                    # Chercher les fichiers récents
+                if files:
+                    final_file = files[0]
+                
+                if not final_file:
                     current_time = time.time()
                     for file in DOWNLOAD_DIR.iterdir():
-                        if file.is_file() and (current_time - file.stat().st_mtime) < 5:
-                            if file.name.startswith(file_uuid):
-                                files.append(file)
-                                break
+                        if file.is_file() and (current_time - file.stat().st_mtime) < 10:
+                            if file.name.startswith(file_uuid) or not final_file:
+                                final_file = file
+                                if file.name.startswith(file_uuid):
+                                    break
                 
-                if not files:
+                if not final_file or not final_file.exists():
                     raise Exception("Fichier introuvable après téléchargement")
                 
-                final_file = files[0]
                 file_size = final_file.stat().st_size
-                
                 if file_size == 0:
                     final_file.unlink()
                     raise Exception("Fichier vide")
@@ -325,7 +326,6 @@ def download_media(url, quality):
                     final_file.unlink()
                     raise Exception(f"Fichier trop volumineux ({file_size} > {MAX_FILE_SIZE})")
                 
-                # ⭐ Renommer avec un nom standardisé
                 ext = final_file.suffix
                 clean_name = f"vens_{file_uuid}{ext}"
                 clean_path = DOWNLOAD_DIR / clean_name
@@ -333,18 +333,6 @@ def download_media(url, quality):
                 if final_file != clean_path:
                     final_file.rename(clean_path)
                     final_file = clean_path
-                
-                # ⭐ STOCKER LE FICHIER DANS LE REGISTRE GLOBAL
-                with created_files_lock:
-                    created_files[clean_name] = {
-                        "path": str(clean_path),
-                        "created": time.time(),
-                        "expires": time.time() + FILE_EXPIRE_TIME
-                    }
-                    # Nettoyer les anciennes entrées
-                    for key in list(created_files.keys()):
-                        if created_files[key]["expires"] < time.time():
-                            del created_files[key]
                 
                 logger.info(f"✅ [{platform}] Téléchargement réussi: {clean_name}")
                 return final_file, info
@@ -363,7 +351,7 @@ def download_media(url, quality):
             active_downloads -= 1
 
 # =========================
-# EXTRACT ENDPOINT
+# EXTRACT ENDPOINT - URL ABSOLUE AUTO
 # =========================
 
 @app.post("/extract")
@@ -384,6 +372,11 @@ def extract():
     try:
         file_path, info = download_media(url, quality)
         
+        # ⭐ URL ABSOLUE - Auto-détection du domaine
+        base_url = request.host_url.rstrip('/')
+        download_url = f"{base_url}/download/{file_path.name}"
+        preview_url = f"{base_url}/preview/{file_path.name}"
+        
         response = {
             "success": True,
             "title": info.get("title", "VENS-DOWNLOADER"),
@@ -393,13 +386,15 @@ def extract():
             "filename": file_path.name,
             "filesize": file_path.stat().st_size,
             "media_type": "audio" if quality.lower() == "audio" else "video",
-            "download_url": f"/download/{file_path.name}",
+            "download_url": download_url,
+            "preview_url": preview_url,
             "ext": file_path.suffix[1:],
             "quality": quality,
             "expires_in": FILE_EXPIRE_TIME
         }
         
         logger.info(f"✅ Succès: {file_path.name} ({file_path.stat().st_size} octets)")
+        logger.info(f"🔗 Download: {download_url}")
         return jsonify(response)
     
     except Exception as e:
@@ -419,7 +414,28 @@ def extract():
         }), 502
 
 # =========================
-# DOWNLOAD ROUTE - VÉRIFICATION STRICTE
+# PREVIEW ROUTE
+# =========================
+
+@app.get("/preview/<filename>")
+def preview(filename):
+    if not check_api_key():
+        return jsonify({"error": "Invalid API key"}), 401
+    
+    filename = safe_filename(filename)
+    file_path = DOWNLOAD_DIR / filename
+    
+    if not file_path.exists():
+        return jsonify({"error": "Fichier introuvable"}), 404
+    
+    return send_file(
+        file_path,
+        mimetype="video/mp4",
+        conditional=True
+    )
+
+# =========================
+# DOWNLOAD ROUTE - STRICT
 # =========================
 
 @app.get("/download/<filename>")
@@ -432,38 +448,24 @@ def download(filename):
     
     logger.info(f"🔍 Téléchargement demandé: {filename}")
     
-    # ⭐ VÉRIFICATION STRICTE
+    # ⭐ VÉRIFICATION STRICTE - Pas de fallback
     if not file_path.exists():
         logger.warning(f"❌ Fichier non trouvé: {filename}")
-        
-        # Vérifier dans le registre global
-        with created_files_lock:
-            if filename in created_files:
-                logger.info(f"📂 Fichier trouvé dans le registre: {created_files[filename]['path']}")
-                file_path = Path(created_files[filename]["path"])
-                if not file_path.exists():
-                    del created_files[filename]
-                    return jsonify({"error": "Fichier expiré"}), 404
-            else:
-                # Lister les fichiers disponibles uniquement en DEBUG
-                if DEBUG:
-                    all_files = list(DOWNLOAD_DIR.iterdir())
-                    logger.info(f"📂 Fichiers disponibles: {[f.name for f in all_files]}")
-                    return jsonify({
-                        "error": "Fichier introuvable",
-                        "requested": filename,
-                        "available_files": [f.name for f in all_files]
-                    }), 404
-                else:
-                    return jsonify({"error": "Fichier introuvable"}), 404
+        if DEBUG:
+            all_files = list(DOWNLOAD_DIR.iterdir())
+            logger.info(f"📂 Fichiers disponibles: {[f.name for f in all_files]}")
+            return jsonify({
+                "error": "Fichier introuvable",
+                "requested": filename,
+                "available_files": [f.name for f in all_files]
+            }), 404
+        else:
+            return jsonify({"error": "Fichier introuvable"}), 404
     
     # Vérifier la sécurité
     if not is_within_download_dir(file_path):
         logger.warning(f"⚠️ Tentative de sortie du dossier: {filename}")
         return jsonify({"error": "Accès interdit"}), 403
-    
-    if not file_path.exists():
-        return jsonify({"error": "Fichier expiré ou introuvable"}), 404
     
     # Déterminer le type MIME
     ext = file_path.suffix.lower()
@@ -483,10 +485,6 @@ def download(filename):
             try:
                 if file_path.exists():
                     file_path.unlink()
-                    # Supprimer du registre
-                    with created_files_lock:
-                        if filename in created_files:
-                            del created_files[filename]
                     logger.info(f"🗑️ Fichier supprimé: {filename}")
             except Exception as e:
                 logger.error(f"Erreur suppression: {e}")
@@ -495,7 +493,7 @@ def download(filename):
         timer.daemon = True
         timer.start()
     
-    logger.info(f"✅ Envoi du fichier: {filename} ({file_path.stat().st_size} octets)")
+    logger.info(f"✅ Envoi du fichier: {file_path.name} ({file_path.stat().st_size} octets)")
     
     return send_file(
         file_path,
@@ -533,7 +531,8 @@ def get_info():
             "Accept-Encoding": "gzip, deflate"
         },
         "extractor_args": {
-            "youtube": {"player_client": ["android"]}
+            "youtube": {"player_client": ["android"]},
+            "pinterest": {"use_api": ["1"]}
         }
     }
     
@@ -556,12 +555,11 @@ def get_info():
         return jsonify({"error": str(e)}), 500
 
 # =========================
-# DEBUG - LISTE DES FICHIERS (PROTÉGÉ)
+# DEBUG - LISTE DES FICHIERS
 # =========================
 
 @app.get("/debug/files")
 def debug_files():
-    """Endpoint pour diagnostiquer les fichiers disponibles - UNIQUEMENT EN DEBUG"""
     if not DEBUG:
         return jsonify({"error": "Debug mode disabled"}), 403
     
@@ -582,11 +580,11 @@ def debug_files():
         "count": len(files),
         "files": files,
         "directory": str(DOWNLOAD_DIR),
-        "registered_files": list(created_files.keys()),
         "delete_after_download": DELETE_AFTER_DOWNLOAD,
         "cleanup_delay": CLEANUP_DELAY,
         "file_expire_time": FILE_EXPIRE_TIME,
-        "debug": DEBUG
+        "debug": DEBUG,
+        "base_url": BASE_URL
     })
 
 # =========================
@@ -608,7 +606,7 @@ def stats():
         "max_concurrent": MAX_CONCURRENT_DOWNLOADS,
         "ffmpeg": FFMPEG_AVAILABLE,
         "storage_free_mb": shutil.disk_usage(DOWNLOAD_DIR).free // (1024*1024),
-        "registered_files": len(created_files)
+        "base_url": BASE_URL
     })
 
 # =========================
@@ -617,19 +615,20 @@ def stats():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    debug = os.environ.get("DEBUG", "False").lower() == "true"
+    debug = os.environ.get("DEBUG", "True").lower() == "true"
     
     print(f"""
 ╔══════════════════════════════════════════════════════════════════════╗
-║  🚀 VENS-DOWNLOADER SERVER v12.3 — PRODUCTION FINALE 10/10         ║
+║  🚀 VENS-DOWNLOADER SERVER v12.6 — FINAL 10/10                    ║
 ║  📦 yt-dlp: {yt_dlp.version.__version__}                                      ║
 ║  ✅ FFmpeg: {'✅' if FFMPEG_AVAILABLE else '❌'}                                                    ║
-║  📁 Downloads: {DOWNLOAD_DIR}          ║
+║  🌐 BASE_URL: {BASE_URL}     ║
 ║  🔐 API Key: {'✅' if API_KEY else '❌'}                                                       ║
-║  🗑️ Delete after download: {DELETE_AFTER_DOWNLOAD} (delay: {CLEANUP_DELAY}s)   ║
-║  🔍 Debug: {'✅' if DEBUG else '❌'} (protégé)                                      ║
-║  📊 Gunicorn: Recommandé -w 1 ou stockage partagé                     ║
-║  📂 Registre fichiers: {'✅ Activé'} (évite les conflits workers)     ║
+║  📁 Downloads: {DOWNLOAD_DIR}          ║
+║  🔍 Debug: {'✅' if DEBUG else '❌'}                                                  ║
+║  📂 Fallback: ❌ NON (404 strict)                                      ║
+║  🖼️ Preview: /preview/ disponible                                      ║
+║  ✨ Auto-détection du domaine: OUI                                   ║
 ╚══════════════════════════════════════════════════════════════════════╝
     """)
     
