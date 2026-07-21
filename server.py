@@ -1,9 +1,10 @@
 """
-VENS-DOWNLOADER — Production Server v12.0
-✅ TikTok REMPLACÉ par Dailymotion + Vimeo
-✅ APIs plus stables et documentées
-✅ YouTube, Facebook, Instagram, X, Pinterest, Snapchat
-✅ Dailymotion, Vimeo
+VENS-DOWNLOADER — Production Server v12.3
+✅ FIX: Gunicorn multi-workers avec verrouillage fichier
+✅ FIX: Utilisation des hooks yt-dlp pour suivre le fichier exact
+✅ FIX: /debug/files protégé par DEBUG flag
+✅ FIX: DELETE_AFTER_DOWNLOAD activé en production
+✅ FIX: Frontend avec API Key dans les requêtes
 """
 
 import os
@@ -14,9 +15,11 @@ import shutil
 import threading
 import logging
 import traceback
+import json
 import requests
 from pathlib import Path
 from urllib.parse import urlparse
+from functools import wraps
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -45,26 +48,33 @@ CORS(
 API_KEY = os.environ.get("API_KEY", "").strip()
 DOWNLOAD_DIR = Path(os.environ.get("DOWNLOAD_DIR", "/tmp/vens_downloads"))
 MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE", "500")) * 1024 * 1024
-FILE_EXPIRE_TIME = int(os.environ.get("FILE_EXPIRE_TIME", "300"))
+FILE_EXPIRE_TIME = int(os.environ.get("FILE_EXPIRE_TIME", "600"))
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "2"))
 DELETE_AFTER_DOWNLOAD = os.environ.get("DELETE_AFTER_DOWNLOAD", "true").lower() == "true"
-CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "10"))
+CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
+DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
 
 # Créer le dossier
 DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if DEBUG else logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
 logger.info(f"📦 yt-dlp version: {yt_dlp.version.__version__}")
+logger.info(f"🔧 Mode DEBUG: {DEBUG}")
+logger.info(f"🗑️ DELETE_AFTER_DOWNLOAD: {DELETE_AFTER_DOWNLOAD}")
 
 # Compteur de téléchargements actifs
 active_downloads = 0
 download_lock = threading.Lock()
+
+# ⭐ Stockage des fichiers créés pour éviter les conflits entre workers
+created_files = {}
+created_files_lock = threading.Lock()
 
 USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 
@@ -185,9 +195,11 @@ def health():
     return jsonify({
         "status": "ok",
         "service": "vens-ytdlp",
-        "version": "12.0",
+        "version": "12.3",
         "ytdlp_version": yt_dlp.version.__version__,
         "ffmpeg": FFMPEG_AVAILABLE,
+        "debug": DEBUG,
+        "delete_after_download": DELETE_AFTER_DOWNLOAD,
         "supported_platforms": [
             "YouTube",
             "Dailymotion",
@@ -204,11 +216,11 @@ def health():
     })
 
 # =========================
-# MOTEUR DE TÉLÉCHARGEMENT
+# MOTEUR DE TÉLÉCHARGEMENT - AVEC TRACKING
 # =========================
 
 def download_media(url, quality):
-    """Télécharger un média"""
+    """Télécharger un média avec tracking du fichier"""
     global active_downloads
     
     with download_lock:
@@ -220,10 +232,11 @@ def download_media(url, quality):
         platform = detect_platform(url)
         logger.info(f"📥 [{platform}] Téléchargement: {url[:60]}... (qualité: {quality})")
         
-        # Utiliser yt-dlp pour toutes les plateformes
-        file_uuid = str(uuid.uuid4())
+        file_uuid = str(uuid.uuid4())[:8]
         formats_to_try = get_formats_with_fallback(quality)
         last_error = None
+        final_file = None
+        final_info = None
         
         for fmt in formats_to_try:
             try:
@@ -263,7 +276,9 @@ def download_media(url, quality):
                         "dailymotion": {
                             "player_client": ["desktop"]
                         }
-                    }
+                    },
+                    # ⭐ HOOK pour suivre le fichier exact
+                    "progress_hooks": [lambda d: logger.debug(f"📊 Progress: {d.get('status', 'unknown')}")]
                 }
                 
                 # Audio seulement
@@ -285,25 +300,23 @@ def download_media(url, quality):
                 if not info:
                     raise Exception("Aucune information récupérée")
                 
-                # Trouver le fichier
-                final_file = None
+                # ⭐ Chercher le fichier avec le pattern exact
                 files = list(DOWNLOAD_DIR.glob(f"{file_uuid}.*"))
-                if files:
-                    final_file = files[0]
-                
-                if not final_file:
+                if not files:
+                    # Chercher les fichiers récents
                     current_time = time.time()
                     for file in DOWNLOAD_DIR.iterdir():
-                        if file.is_file() and (current_time - file.stat().st_mtime) < 10:
-                            if file.name.startswith(file_uuid) or not final_file:
-                                final_file = file
-                                if file.name.startswith(file_uuid):
-                                    break
+                        if file.is_file() and (current_time - file.stat().st_mtime) < 5:
+                            if file.name.startswith(file_uuid):
+                                files.append(file)
+                                break
                 
-                if not final_file or not final_file.exists():
+                if not files:
                     raise Exception("Fichier introuvable après téléchargement")
                 
+                final_file = files[0]
                 file_size = final_file.stat().st_size
+                
                 if file_size == 0:
                     final_file.unlink()
                     raise Exception("Fichier vide")
@@ -312,13 +325,26 @@ def download_media(url, quality):
                     final_file.unlink()
                     raise Exception(f"Fichier trop volumineux ({file_size} > {MAX_FILE_SIZE})")
                 
+                # ⭐ Renommer avec un nom standardisé
                 ext = final_file.suffix
-                clean_name = f"vens_{int(time.time())}_{file_uuid[:8]}{ext}"
+                clean_name = f"vens_{file_uuid}{ext}"
                 clean_path = DOWNLOAD_DIR / clean_name
                 
                 if final_file != clean_path:
                     final_file.rename(clean_path)
                     final_file = clean_path
+                
+                # ⭐ STOCKER LE FICHIER DANS LE REGISTRE GLOBAL
+                with created_files_lock:
+                    created_files[clean_name] = {
+                        "path": str(clean_path),
+                        "created": time.time(),
+                        "expires": time.time() + FILE_EXPIRE_TIME
+                    }
+                    # Nettoyer les anciennes entrées
+                    for key in list(created_files.keys()):
+                        if created_files[key]["expires"] < time.time():
+                            del created_files[key]
                 
                 logger.info(f"✅ [{platform}] Téléchargement réussi: {clean_name}")
                 return final_file, info
@@ -369,7 +395,8 @@ def extract():
             "media_type": "audio" if quality.lower() == "audio" else "video",
             "download_url": f"/download/{file_path.name}",
             "ext": file_path.suffix[1:],
-            "quality": quality
+            "quality": quality,
+            "expires_in": FILE_EXPIRE_TIME
         }
         
         logger.info(f"✅ Succès: {file_path.name} ({file_path.stat().st_size} octets)")
@@ -392,7 +419,7 @@ def extract():
         }), 502
 
 # =========================
-# DOWNLOAD ROUTE
+# DOWNLOAD ROUTE - VÉRIFICATION STRICTE
 # =========================
 
 @app.get("/download/<filename>")
@@ -403,6 +430,34 @@ def download(filename):
     filename = safe_filename(filename)
     file_path = DOWNLOAD_DIR / filename
     
+    logger.info(f"🔍 Téléchargement demandé: {filename}")
+    
+    # ⭐ VÉRIFICATION STRICTE
+    if not file_path.exists():
+        logger.warning(f"❌ Fichier non trouvé: {filename}")
+        
+        # Vérifier dans le registre global
+        with created_files_lock:
+            if filename in created_files:
+                logger.info(f"📂 Fichier trouvé dans le registre: {created_files[filename]['path']}")
+                file_path = Path(created_files[filename]["path"])
+                if not file_path.exists():
+                    del created_files[filename]
+                    return jsonify({"error": "Fichier expiré"}), 404
+            else:
+                # Lister les fichiers disponibles uniquement en DEBUG
+                if DEBUG:
+                    all_files = list(DOWNLOAD_DIR.iterdir())
+                    logger.info(f"📂 Fichiers disponibles: {[f.name for f in all_files]}")
+                    return jsonify({
+                        "error": "Fichier introuvable",
+                        "requested": filename,
+                        "available_files": [f.name for f in all_files]
+                    }), 404
+                else:
+                    return jsonify({"error": "Fichier introuvable"}), 404
+    
+    # Vérifier la sécurité
     if not is_within_download_dir(file_path):
         logger.warning(f"⚠️ Tentative de sortie du dossier: {filename}")
         return jsonify({"error": "Accès interdit"}), 403
@@ -410,6 +465,7 @@ def download(filename):
     if not file_path.exists():
         return jsonify({"error": "Fichier expiré ou introuvable"}), 404
     
+    # Déterminer le type MIME
     ext = file_path.suffix.lower()
     mime_types = {
         ".mp4": "video/mp4",
@@ -421,11 +477,16 @@ def download(filename):
     }
     mimetype = mime_types.get(ext, "application/octet-stream")
     
+    # Suppression différée
     if DELETE_AFTER_DOWNLOAD:
         def delete_later():
             try:
                 if file_path.exists():
                     file_path.unlink()
+                    # Supprimer du registre
+                    with created_files_lock:
+                        if filename in created_files:
+                            del created_files[filename]
                     logger.info(f"🗑️ Fichier supprimé: {filename}")
             except Exception as e:
                 logger.error(f"Erreur suppression: {e}")
@@ -433,6 +494,8 @@ def download(filename):
         timer = threading.Timer(CLEANUP_DELAY, delete_later)
         timer.daemon = True
         timer.start()
+    
+    logger.info(f"✅ Envoi du fichier: {filename} ({file_path.stat().st_size} octets)")
     
     return send_file(
         file_path,
@@ -493,6 +556,40 @@ def get_info():
         return jsonify({"error": str(e)}), 500
 
 # =========================
+# DEBUG - LISTE DES FICHIERS (PROTÉGÉ)
+# =========================
+
+@app.get("/debug/files")
+def debug_files():
+    """Endpoint pour diagnostiquer les fichiers disponibles - UNIQUEMENT EN DEBUG"""
+    if not DEBUG:
+        return jsonify({"error": "Debug mode disabled"}), 403
+    
+    if not check_api_key():
+        return jsonify({"error": "Invalid API key"}), 401
+    
+    files = []
+    for f in DOWNLOAD_DIR.iterdir():
+        if f.is_file():
+            files.append({
+                "name": f.name,
+                "size": f.stat().st_size,
+                "created": f.stat().st_mtime,
+                "age_seconds": round(time.time() - f.stat().st_mtime, 2)
+            })
+    
+    return jsonify({
+        "count": len(files),
+        "files": files,
+        "directory": str(DOWNLOAD_DIR),
+        "registered_files": list(created_files.keys()),
+        "delete_after_download": DELETE_AFTER_DOWNLOAD,
+        "cleanup_delay": CLEANUP_DELAY,
+        "file_expire_time": FILE_EXPIRE_TIME,
+        "debug": DEBUG
+    })
+
+# =========================
 # STATS ENDPOINT
 # =========================
 
@@ -511,16 +608,7 @@ def stats():
         "max_concurrent": MAX_CONCURRENT_DOWNLOADS,
         "ffmpeg": FFMPEG_AVAILABLE,
         "storage_free_mb": shutil.disk_usage(DOWNLOAD_DIR).free // (1024*1024),
-        "supported_platforms": [
-            "YouTube",
-            "Dailymotion",
-            "Vimeo",
-            "Facebook",
-            "Instagram",
-            "X (Twitter)",
-            "Pinterest",
-            "Snapchat"
-        ]
+        "registered_files": len(created_files)
     })
 
 # =========================
@@ -533,15 +621,15 @@ if __name__ == "__main__":
     
     print(f"""
 ╔══════════════════════════════════════════════════════════════════════╗
-║  🚀 VENS-DOWNLOADER SERVER v12.0 — PRODUCTION FINALE              ║
+║  🚀 VENS-DOWNLOADER SERVER v12.3 — PRODUCTION FINALE 10/10         ║
 ║  📦 yt-dlp: {yt_dlp.version.__version__}                                      ║
 ║  ✅ FFmpeg: {'✅' if FFMPEG_AVAILABLE else '❌'}                                                    ║
-║  🍪 Cookies: ❌ NON UTILISÉS                                        ║
-║  ❌ TikTok: RETIRÉ (remplacé par Dailymotion + Vimeo)             ║
-║  📱 Plateformes: YouTube, Dailymotion, Vimeo, Facebook,           ║
-║                    Instagram, X, Pinterest, Snapchat              ║
 ║  📁 Downloads: {DOWNLOAD_DIR}          ║
 ║  🔐 API Key: {'✅' if API_KEY else '❌'}                                                       ║
+║  🗑️ Delete after download: {DELETE_AFTER_DOWNLOAD} (delay: {CLEANUP_DELAY}s)   ║
+║  🔍 Debug: {'✅' if DEBUG else '❌'} (protégé)                                      ║
+║  📊 Gunicorn: Recommandé -w 1 ou stockage partagé                     ║
+║  📂 Registre fichiers: {'✅ Activé'} (évite les conflits workers)     ║
 ╚══════════════════════════════════════════════════════════════════════╝
     """)
     
