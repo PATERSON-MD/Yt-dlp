@@ -1,15 +1,10 @@
 """
-VENS-DOWNLOADER — Production Server v20.0
-✅ Verrou Redis pour nettoyage (pas de IS_MAIN_WORKER)
-✅ Heartbeat Redis pendant les téléchargements
-✅ Tokens signés (itsdangerous) - pas de stockage
-✅ Progress hook pour renouveler TTL
-✅ Vérification Content-Type (text/html bloqué)
-✅ Validation FFmpeg complète
-✅ Limites Flask (MAX_CONTENT_LENGTH)
-✅ Headers de sécurité
-✅ tempfile.mkstemp pour fichiers temporaires
-✅ Endpoint /metrics pour monitoring
+VENS-DOWNLOADER — Production Server v21.0
+✅ YouTube: API Asitha + yt-dlp + cookies (fallback)
+✅ Détection des erreurs de blocage YouTube
+✅ Mise à jour automatique yt-dlp
+✅ Désactivation API Asitha via variable
+✅ Métriques, tokens signés, Redis, headers sécurité
 """
 
 import os
@@ -57,7 +52,7 @@ MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_SIZE", "500")) * 1024 * 1024
 FILE_EXPIRE_TIME = int(os.environ.get("FILE_EXPIRE_TIME", "600"))
 MAX_CONCURRENT_DOWNLOADS = int(os.environ.get("MAX_CONCURRENT_DOWNLOADS", "2"))
 MAX_CONCURRENT_PER_IP = int(os.environ.get("MAX_CONCURRENT_PER_IP", "2"))
-DELETE_AFTER_DOWNLOAD = os.environ.get("DELETE_AFTER_DOWNLOAD", "false").lower() == "true"
+DELETE_AFTER_DOWNLOAD = os.environ.get("DELETE_AFTER_DOWNLOAD", "true").lower() == "true"
 CLEANUP_DELAY = int(os.environ.get("CLEANUP_DELAY", "300"))
 DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
 TOKEN_EXPIRE_SECONDS = int(os.environ.get("TOKEN_EXPIRE_SECONDS", "300"))
@@ -66,8 +61,12 @@ RATE_LIMIT_WINDOW = int(os.environ.get("RATE_LIMIT_WINDOW", "60"))
 API_TIMEOUT = int(os.environ.get("API_TIMEOUT", "30"))
 REDIS_URL = os.environ.get("REDIS_URL", "").strip()
 USE_REDIS = bool(REDIS_URL)
-YOUTUBE_DL_VERSION = os.environ.get("YOUTUBE_DL_VERSION", "latest")
 FLASK_MAX_CONTENT_LENGTH = int(os.environ.get("FLASK_MAX_CONTENT_LENGTH", "5")) * 1024 * 1024
+
+# ⭐ YouTube Configuration
+ENABLE_ASITHA = os.environ.get("ENABLE_ASITHA", "true").lower() == "true"
+COOKIES_FILE = os.environ.get("COOKIES_FILE", "").strip()
+AUTO_UPDATE_YTDLP = os.environ.get("AUTO_UPDATE_YTDLP", "true").lower() == "true"
 
 # CORS
 CORS_ORIGINS = os.environ.get("CORS_ORIGINS", "").strip()
@@ -100,13 +99,15 @@ else:
     else:
         BASE_URL = "http://localhost:8000"
 
-# ⭐ Token signé avec itsdangerous
+# ⭐ Token signé
 token_serializer = URLSafeTimedSerializer(API_KEY)
 
-logger.info(f"🚀 VENS-DOWNLOADER v20.0")
+logger.info(f"🚀 VENS-DOWNLOADER v21.0")
 logger.info(f"📦 yt-dlp: {yt_dlp.version.__version__}")
 logger.info(f"🌐 BASE_URL: {BASE_URL}")
 logger.info(f"🔴 Redis: {'✅' if USE_REDIS else '❌'}")
+logger.info(f"📱 Asitha: {'✅' if ENABLE_ASITHA else '❌'}")
+logger.info(f"🍪 Cookies: {'✅' if COOKIES_FILE else '❌'}")
 
 # =========================
 # MÉTRIQUES
@@ -260,13 +261,31 @@ class RedisClient:
 redis_client = RedisClient(REDIS_URL) if REDIS_URL else None
 
 # =========================
+# MISE À JOUR YT-DLP
+# =========================
+
+if AUTO_UPDATE_YTDLP:
+    try:
+        result = subprocess.run(
+            ["pip", "install", "-U", "yt-dlp"],
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        if result.returncode == 0:
+            logger.info("✅ yt-dlp mis à jour avec succès")
+        else:
+            logger.warning(f"⚠️ Erreur mise à jour yt-dlp: {result.stderr}")
+    except Exception as e:
+        logger.warning(f"⚠️ Erreur mise à jour yt-dlp: {e}")
+
+# =========================
 # FLASK APP
 # =========================
 
 app = Flask(__name__)
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_port=1, x_prefix=1)
 
-# ⭐ Limite de taille des requêtes
 app.config["MAX_CONTENT_LENGTH"] = FLASK_MAX_CONTENT_LENGTH
 
 CORS(
@@ -398,7 +417,6 @@ def is_within_download_dir(filepath):
     except:
         return False
 
-# ⭐ SSRF
 def resolve_hostname(hostname):
     ips = []
     try:
@@ -532,16 +550,13 @@ def release_ip_limit(ip):
 # =========================
 
 def generate_token(filename):
-    """Générer un token signé (pas de stockage)"""
     try:
         return token_serializer.dumps(filename)
     except Exception as e:
         logger.error(f"❌ Erreur génération token: {e}")
-        # Fallback sur token simple
         return hashlib.sha256(f"{filename}{time.time()}{os.urandom(16)}".encode()).hexdigest()[:16]
 
 def validate_token(token, filename, delete=False):
-    """Valider un token signé (pas de stockage)"""
     try:
         loaded = token_serializer.loads(token, max_age=TOKEN_EXPIRE_SECONDS)
         return loaded == filename
@@ -560,7 +575,6 @@ def validate_token(token, filename, delete=False):
 # =========================
 
 def acquire_cleanup_lock():
-    """Acquérir le verrou Redis pour le nettoyage"""
     if not (redis_client and redis_client.enabled):
         return True
     
@@ -571,7 +585,6 @@ def acquire_cleanup_lock():
         return False
 
 def renew_cleanup_lock():
-    """Renouveler le verrou Redis pour le nettoyage"""
     if not (redis_client and redis_client.enabled):
         return True
     
@@ -582,14 +595,12 @@ def renew_cleanup_lock():
         return False
 
 # =========================
-# PROGRESS HOOK yt-dlp
+# PROGRESS HOOK YT-DLP
 # =========================
 
 def create_progress_hook(global_key, ip_key, client_ip):
-    """Créer un hook de progression pour renouveler les TTL"""
     def progress_hook(d):
         if d.get("status") == "downloading":
-            # Renouveler les TTL pendant le téléchargement
             if redis_client and redis_client.enabled:
                 try:
                     redis_client.expire(global_key, 300)
@@ -633,6 +644,27 @@ def mask_url(url):
         return url[:60] + "..."
 
 # =========================
+# DÉTECTION BLOCAGE YOUTUBE
+# =========================
+
+def is_youtube_block_error(error_msg):
+    if not error_msg:
+        return False
+    
+    block_indicators = [
+        "Sign in to confirm",
+        "bot",
+        "429",
+        "Too Many Requests",
+        "cookies",
+        "logged out",
+        "quota exceeded",
+        "Sign in to confirm you're not a bot"
+    ]
+    
+    return any(indicator.lower() in error_msg.lower() for indicator in block_indicators)
+
+# =========================
 # VALIDATION MAGIC BYTES
 # =========================
 
@@ -656,7 +688,10 @@ def validate_magic_bytes(file_path):
         logger.error(f"❌ Erreur validation magic bytes: {e}")
         return False
 
-# ⭐ VALIDATION FFprobe
+# =========================
+# VALIDATION FFprobe ET FFmpeg
+# =========================
+
 def validate_with_ffprobe(file_path):
     if not FFPROBE_AVAILABLE:
         return True
@@ -679,7 +714,6 @@ def validate_with_ffprobe(file_path):
         logger.warning(f"⚠️ Erreur FFprobe: {e}")
         return True
 
-# ⭐ VALIDATION FFmpeg (détection fichiers corrompus)
 def validate_with_ffmpeg(file_path):
     if not FFMPEG_AVAILABLE:
         return True
@@ -696,7 +730,6 @@ def validate_with_ffmpeg(file_path):
             logger.debug(f"✅ FFmpeg validation OK")
             return True
         
-        # Certains fichiers peuvent avoir des warning mais être valides
         if "Invalid data found" in result.stderr:
             return False
         
@@ -745,19 +778,19 @@ def validate_api_response(data, platform):
     return {"video_url": video_url, "title": title, "thumbnail": thumbnail, "duration": duration}
 
 # =========================
-# API EXTERNE
+# API EXTERNE - ASITHA.TOP
 # =========================
 
-def download_via_asitha_api(url, platform, quality="720", progress_hook=None):
-    if not ASITHA_API_KEY:
-        return None, None
+def download_via_asitha_api(url, platform, quality="720"):
+    if not ASITHA_API_KEY or not ENABLE_ASITHA:
+        return None, {"error": "asitha_disabled"}
     
     if platform == "TikTok":
         endpoint = ASITHA_TIKTOK_ENDPOINT
     elif platform == "YouTube":
         endpoint = ASITHA_YOUTUBE_ENDPOINT
     else:
-        return None, None
+        return None, {"error": "unsupported_platform"}
     
     temp_path = None
     fd = None
@@ -805,7 +838,6 @@ def download_via_asitha_api(url, platform, quality="720", progress_hook=None):
             logger.warning(f"⚠️ SSRF bloquée: {video_url}")
             return None, {"error": "ssrf_blocked"}
         
-        # HEAD optionnel
         file_size = None
         try:
             head_response = requests.head(video_url, timeout=10, allow_redirects=True)
@@ -821,7 +853,6 @@ def download_via_asitha_api(url, platform, quality="720", progress_hook=None):
         
         file_uuid = str(uuid.uuid4())[:8]
         
-        # ⭐ Utiliser tempfile.mkstemp pour plus de sécurité
         fd, temp_path_str = tempfile.mkstemp(dir=DOWNLOAD_DIR, prefix=f"{platform.lower()}_{file_uuid}_", suffix=".tmp")
         temp_path = Path(temp_path_str)
         os.close(fd)
@@ -838,7 +869,6 @@ def download_via_asitha_api(url, platform, quality="720", progress_hook=None):
             temp_path.unlink(missing_ok=True)
             return None, {"error": f"download_failed_{video_response.status_code}"}
         
-        # ⭐ Vérifier Content-Type
         content_type = video_response.headers.get("Content-Type", "")
         if "text/html" in content_type:
             temp_path.unlink(missing_ok=True)
@@ -872,20 +902,19 @@ def download_via_asitha_api(url, platform, quality="720", progress_hook=None):
         
         temp_path.rename(final_path)
         
-        # Mettre à jour les métriques
         with metrics_lock:
             metrics["total_downloads"] += 1
             metrics["successful_downloads"] += 1
             metrics["bytes_downloaded"] += total_size
         
         info = {"title": title, "thumbnail": thumbnail, "duration": duration, "ext": "mp4"}
-        logger.info(f"✅ {platform} téléchargé: {final_path.name}")
+        logger.info(f"✅ {platform} via Asitha: {final_path.name}")
         return final_path, info
         
     except Exception as e:
         if temp_path and temp_path.exists():
             temp_path.unlink(missing_ok=True)
-        logger.error(f"❌ API externe: {e}")
+        logger.error(f"❌ Asitha: {e}")
         with metrics_lock:
             metrics["failed_downloads"] += 1
         return None, {"error": str(e)}
@@ -893,6 +922,151 @@ def download_via_asitha_api(url, platform, quality="720", progress_hook=None):
     finally:
         if temp_path and temp_path.exists():
             temp_path.unlink(missing_ok=True)
+
+# =========================
+# YOUTUBE YT-DLP
+# =========================
+
+def download_youtube_ytdlp(url, quality, use_cookies=False):
+    """Télécharger YouTube via yt-dlp (avec ou sans cookies)"""
+    
+    file_uuid = str(uuid.uuid4())[:8]
+    temp_path = None
+    
+    ydl_opts = {
+        "format": "best[height<=720]/best",
+        "outtmpl": str(DOWNLOAD_DIR / f"{file_uuid}.%(ext)s"),
+        "quiet": True,
+        "no_warnings": False,
+        "noplaylist": True,
+        "nocheckcertificate": False,
+        "ignoreerrors": False,
+        "retries": 5,
+        "fragment_retries": 5,
+        "merge_output_format": "mp4",
+        "geo_bypass": True,
+        "geo_bypass_country": "FR",
+        "socket_timeout": 30,
+        "cachedir": False,
+        "overwrites": True,
+        "concurrent_fragment_downloads": 4,
+        "http_headers": {
+            "User-Agent": USER_AGENT,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        },
+        "extractor_args": {
+            "youtube": {"player_client": ["android"]}
+        }
+    }
+    
+    if use_cookies and COOKIES_FILE and os.path.exists(COOKIES_FILE):
+        ydl_opts["cookiefile"] = COOKIES_FILE
+        logger.info("🍪 Utilisation du fichier cookies")
+    
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+        
+        if not info:
+            raise Exception("Aucune information récupérée")
+        
+        files = list(DOWNLOAD_DIR.glob(f"{file_uuid}.*"))
+        if not files:
+            current_time = time.time()
+            for file in DOWNLOAD_DIR.iterdir():
+                if file.is_file() and (current_time - file.stat().st_mtime) < 10:
+                    if file.name.startswith(file_uuid):
+                        files = [file]
+                        break
+        
+        if not files:
+            raise Exception("Fichier introuvable")
+        
+        temp_path = files[0]
+        
+        if temp_path.stat().st_size == 0:
+            temp_path.unlink()
+            raise Exception("Fichier vide")
+        
+        if temp_path.stat().st_size > MAX_FILE_SIZE:
+            temp_path.unlink()
+            raise Exception(f"Fichier trop volumineux ({temp_path.stat().st_size} > {MAX_FILE_SIZE})")
+        
+        if not validate_magic_bytes(temp_path):
+            temp_path.unlink()
+            raise Exception("Format de fichier invalide")
+        
+        if not validate_with_ffprobe(temp_path):
+            temp_path.unlink()
+            raise Exception("FFprobe validation échouée")
+        
+        if not validate_with_ffmpeg(temp_path):
+            temp_path.unlink()
+            raise Exception("FFmpeg validation échouée")
+        
+        ext = temp_path.suffix
+        clean_name = f"vens_{file_uuid}{ext}"
+        final_path = DOWNLOAD_DIR / clean_name
+        temp_path.rename(final_path)
+        
+        return final_path, {"title": info.get("title", "YouTube Video"), "ext": ext[1:]}
+        
+    except Exception as e:
+        if temp_path and temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise
+
+# =========================
+# YOUTUBE PRINCIPAL
+# =========================
+
+def download_youtube(url, quality, client_ip):
+    """Télécharger YouTube avec 3 niveaux de fallback"""
+    
+    # Niveau 1: API Asitha
+    if ENABLE_ASITHA:
+        try:
+            logger.info("🔄 YouTube: Niveau 1 - API Asitha")
+            file_path, error = download_via_asitha_api(url, "YouTube", quality)
+            if file_path:
+                logger.info("✅ YouTube: API Asitha réussi")
+                return file_path, {"title": "YouTube Video", "ext": "mp4"}
+            
+            if error:
+                logger.warning(f"⚠️ API Asitha échouée: {error}")
+                if error.get("error") in ["quota_exceeded", "invalid_key"]:
+                    logger.info("📌 Erreur API permanente, passage au fallback")
+        except Exception as e:
+            logger.warning(f"⚠️ Erreur API Asitha: {e}")
+    
+    # Niveau 2: yt-dlp sans cookies
+    try:
+        logger.info("🔄 YouTube: Niveau 2 - yt-dlp sans cookies")
+        file_path, info = download_youtube_ytdlp(url, quality, use_cookies=False)
+        if file_path:
+            logger.info("✅ YouTube: yt-dlp sans cookies réussi")
+            return file_path, info
+    except Exception as e:
+        error_msg = str(e)
+        logger.warning(f"⚠️ yt-dlp sans cookies échoué: {error_msg}")
+        
+        # Niveau 3: yt-dlp avec cookies (seulement si blocage)
+        if is_youtube_block_error(error_msg):
+            if COOKIES_FILE and os.path.exists(COOKIES_FILE):
+                try:
+                    logger.info("🔄 YouTube: Niveau 3 - yt-dlp avec cookies")
+                    file_path, info = download_youtube_ytdlp(url, quality, use_cookies=True)
+                    if file_path:
+                        logger.info("✅ YouTube: yt-dlp avec cookies réussi")
+                        return file_path, info
+                except Exception as e2:
+                    logger.error(f"❌ yt-dlp avec cookies échoué: {e2}")
+            else:
+                logger.warning("⚠️ Cookies non disponibles pour le fallback")
+        else:
+            logger.info("📌 Erreur non-blocage, fallback cookies non nécessaire")
+    
+    raise Exception("YouTube: Tous les niveaux de téléchargement ont échoué")
 
 # =========================
 # FORMAT
@@ -921,7 +1095,7 @@ def content_disposition_utf8(filename):
     return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{encoded}'
 
 # =========================
-# NETTOYAGE AUTOMATIQUE (AVEC VERROU REDIS)
+# NETTOYAGE AUTOMATIQUE
 # =========================
 
 def cleanup_worker():
@@ -930,7 +1104,6 @@ def cleanup_worker():
     logger.info("🧹 Thread de nettoyage démarré")
     cleanup_worker_running = True
     
-    # Acquérir le verrou
     if not acquire_cleanup_lock():
         logger.info("🧹 Un autre worker nettoie déjà, arrêt")
         cleanup_worker_running = False
@@ -941,7 +1114,6 @@ def cleanup_worker():
     
     try:
         while cleanup_worker_running:
-            # Renouveler le verrou
             if not renew_cleanup_lock():
                 logger.warning("🧹 Verrou perdu, tentative de réacquisition...")
                 if not acquire_cleanup_lock():
@@ -971,12 +1143,10 @@ def cleanup_worker():
         logger.info("🧹 Thread de nettoyage arrêté")
 
 def start_cleanup_worker():
-    """Démarrer le worker de nettoyage dans un thread"""
     thread = threading.Thread(target=cleanup_worker, daemon=True)
     thread.start()
     return thread
 
-# Démarrer le nettoyage au lancement
 cleanup_thread = start_cleanup_worker()
 
 # =========================
@@ -985,7 +1155,7 @@ cleanup_thread = start_cleanup_worker()
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok", "service": "vens-ytdlp", "version": "20.0"})
+    return jsonify({"status": "ok", "service": "vens-ytdlp", "version": "21.0"})
 
 @app.get("/")
 def root():
@@ -995,13 +1165,15 @@ def root():
     return jsonify({
         "status": "ok",
         "service": "vens-ytdlp",
-        "version": "20.0",
+        "version": "21.0",
         "ytdlp_version": yt_dlp.version.__version__,
         "ffmpeg": FFMPEG_AVAILABLE,
         "ffprobe": FFPROBE_AVAILABLE,
         "debug": DEBUG,
         "base_url": BASE_URL,
         "redis": redis_client.enabled if redis_client else False,
+        "asitha_enabled": ENABLE_ASITHA,
+        "cookies_available": bool(COOKIES_FILE and os.path.exists(COOKIES_FILE)),
         "token_expire_seconds": TOKEN_EXPIRE_SECONDS,
         "rate_limit": {"per_ip": RATE_LIMIT_PER_IP, "window": RATE_LIMIT_WINDOW},
         "max_concurrent_per_ip": MAX_CONCURRENT_PER_IP,
@@ -1062,11 +1234,9 @@ def download_media(url, quality, client_ip):
     temp_path = None
     fd = None
     
-    # Limite par IP
     if not check_ip_limit(client_ip):
         raise Exception(f"Trop de téléchargements simultanés ({MAX_CONCURRENT_PER_IP} max)")
     
-    # Limite globale
     if redis_client and redis_client.enabled:
         global_key = "global_active_downloads"
         ip_key = f"ip_downloads:{client_ip}"
@@ -1087,7 +1257,7 @@ def download_media(url, quality, client_ip):
         platform = detect_platform(url)
         logger.info(f"📥 [{platform}] {mask_url(url)} (qualité: {quality})")
         
-        # TikTok - API externe
+        # ⭐ TIKTOK - API Asitha
         if platform == "TikTok":
             file_path, error = download_via_asitha_api(url, platform, quality)
             if file_path:
@@ -1096,14 +1266,11 @@ def download_media(url, quality, client_ip):
                 raise Exception(f"API TikTok: {error}")
             logger.warning("⚠️ Fallback yt-dlp pour TikTok")
         
-        # YouTube - API externe
+        # ⭐ YOUTUBE - 3 niveaux
         if platform == "YouTube":
-            file_path, error = download_via_asitha_api(url, platform, quality)
-            if file_path:
-                return file_path, {"title": "YouTube Video", "ext": "mp4"}
-            logger.warning("⚠️ Fallback yt-dlp pour YouTube")
+            return download_youtube(url, quality, client_ip)
         
-        # Autres - yt-dlp
+        # AUTRES PLATEFORMES - yt-dlp
         file_uuid = str(uuid.uuid4())[:8]
         
         formats_to_try = get_formats_with_fallback(quality)
@@ -1115,7 +1282,6 @@ def download_media(url, quality, client_ip):
                 
                 output_template = str(DOWNLOAD_DIR / f"{file_uuid}.%(ext)s")
                 
-                # ⭐ Créer le progress hook avec les clés Redis
                 progress_hook = None
                 if redis_client and redis_client.enabled:
                     global_key = "global_active_downloads"
@@ -1157,7 +1323,6 @@ def download_media(url, quality, client_ip):
                     }
                 }
                 
-                # Ajouter progress_hook si disponible
                 if progress_hook:
                     ydl_opts["progress_hooks"] = [progress_hook]
                 
@@ -1177,7 +1342,6 @@ def download_media(url, quality, client_ip):
                 if not info:
                     raise Exception("Aucune information récupérée")
                 
-                # Trouver le fichier
                 files = list(DOWNLOAD_DIR.glob(f"{file_uuid}.*"))
                 if not files:
                     current_time = time.time()
@@ -1218,7 +1382,6 @@ def download_media(url, quality, client_ip):
                 final_path = DOWNLOAD_DIR / clean_name
                 temp_path.rename(final_path)
                 
-                # Mettre à jour les métriques
                 with metrics_lock:
                     metrics["total_downloads"] += 1
                     metrics["successful_downloads"] += 1
@@ -1247,7 +1410,6 @@ def download_media(url, quality, client_ip):
         
         release_ip_limit(client_ip)
         
-        # Nettoyage des fichiers temporaires
         if temp_path and temp_path.exists():
             temp_path.unlink(missing_ok=True)
 
@@ -1285,7 +1447,6 @@ def extract():
     try:
         file_path, info = download_media(url, quality, client_ip)
         
-        # ⭐ Token signé (pas de stockage)
         token = generate_token(file_path.name)
         base_url = request.host_url.rstrip('/')
         download_url = f"{base_url}/download/{file_path.name}?token={token}"
@@ -1330,7 +1491,6 @@ def preview(filename):
     filename = safe_filename(filename)
     token = request.args.get('token', '')
     
-    # ⭐ Token signé - validation sans suppression
     if not validate_token(token, filename, delete=False):
         return jsonify({"error": "Token invalide ou expiré"}), 403
     
@@ -1349,7 +1509,6 @@ def download(filename):
     filename = safe_filename(filename)
     token = request.args.get('token', '')
     
-    # ⭐ Token signé - validation avec suppression (usage unique)
     if not validate_token(token, filename, delete=True):
         return jsonify({"error": "Token invalide ou expiré"}), 403
     
@@ -1508,17 +1667,15 @@ if __name__ == "__main__":
     
     print(f"""
 ╔══════════════════════════════════════════════════════════════════════╗
-║  🚀 VENS-DOWNLOADER SERVER v20.0 — PRODUCTION ULTIME              ║
+║  🚀 VENS-DOWNLOADER SERVER v21.0 — YOUTUBE ULTIME                 ║
 ║  📦 yt-dlp: {yt_dlp.version.__version__}                                      ║
 ║  ✅ FFmpeg: {'✅' if FFMPEG_AVAILABLE else '❌'}                                                    ║
 ║  ✅ FFprobe: {'✅' if FFPROBE_AVAILABLE else '❌'}                                                   ║
 ║  🔴 Redis: {'✅' if (redis_client and redis_client.enabled) else '❌'}                               ║
-║  🔒 Tokens: Signés (itsdangerous) - pas de stockage                  ║
-║  🛡️ Headers de sécurité: X-Content-Type-Options, X-Frame-Options    ║
-║  📊 Métriques: /metrics disponible                                   ║
-║  📁 Validation: Magic bytes + FFprobe + FFmpeg                      ║
-║  🔑 Limites Flask: MAX_CONTENT_LENGTH={FLASK_MAX_CONTENT_LENGTH//(1024*1024)}MB                 ║
-║  🧹 Nettoyage: Verrou Redis (pas de main worker)                   ║
+║  📱 Asitha: {'✅' if ENABLE_ASITHA else '❌'}                                       ║
+║  🍪 Cookies: {'✅' if (COOKIES_FILE and os.path.exists(COOKIES_FILE)) else '❌'}                     ║
+║  🔄 Auto-update yt-dlp: {'✅' if AUTO_UPDATE_YTDLP else '❌'}                               ║
+║  📊 YouTube: 3 niveaux (Asitha → yt-dlp → cookies)                ║
 ║  🌐 BASE_URL: {BASE_URL}     ║
 ║  📦 Gunicorn: {'✅' if os.environ.get('GUNICORN_CMD_ARGS') else '⚠️ Utiliser Gunicorn en prod'}  ║
 ╚══════════════════════════════════════════════════════════════════════╝
