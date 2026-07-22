@@ -1,5 +1,7 @@
 Flask==2.3.3
 Flask-CORS==4.0.0
-yt-dlp>=2025.01.01
+yt-dlp>=2025.01.01,<2026
 gunicorn==21.2.0
 requests>=2.31,<3
+itsdangerous==2.1.2
+redis==5.0.1
